@@ -11,7 +11,7 @@ Each Synced player is on its own device and has the speaker's own name (e.g. "Ki
 
 Volume and mute stay per speaker. Play, pause, skip, and seek control the whole group from any of its speakers. Turning off a grouped speaker removes it from the group and the others keep playing; turning off the last speaker stops playback.
 
-**Group Audio** (`media_player.group_audio`) shows whatever is playing on more than one speaker, always under that name, and is `off` when nothing is. Setting its volume sets every speaker in the group to exactly that level (it shows their average); mute mutes them all. Joining speakers to it adds them to the group, and `unjoin` breaks the group up, leaving the first speaker playing. Only one group is expected at a time; if there are more, it shows the one playing on the most speakers.
+**Group Audio** (`media_player.group_audio`) shows whatever is playing on more than one speaker, always under that name, and is `off` when nothing is. Setting its volume sets every speaker in the group to exactly that level (it shows their average); mute mutes them all. Joining speakers to it adds them to the group, and `unjoin` breaks the group up, leaving the first speaker playing. Turning it off quits the app on the whole group, the same as the power button on the Cast entity of the speaker leading it. Only one group is expected at a time; if there are more, it shows the one playing on the most speakers.
 
 The built-in Google Cast entities that these replace (speakers, stereo pairs, and the "Speaker + N" groups Cast creates while music plays on several speakers) are hidden, so they drop out of auto-generated dashboards and area views but keep working. They aren't disabled, because this integration uses their connections. Unhiding one yourself sticks, and they're all unhidden if Cast Group Sync is disabled or removed.
 
@@ -43,6 +43,7 @@ Replace the example entity IDs with the ones shown for your speakers in Home Ass
 
 - Adding speakers only works when the app allows it (YouTube Music does). If an app doesn't, the action fails with an error that says so.
 - Group membership is read from internal parts of the built-in Google Cast integration. If a Home Assistant update changes those, a warning is logged and the Synced players behave like the built-in ones until this integration is updated.
+- When Cast moves a group to a different leading speaker, the built-in integration can lose track of it. This integration then asks the speakers which group they're in and connects to it itself, so the group may show as separate speakers for up to about 40 seconds.
 - If the speaker leading a group is removed, the remaining speakers may show `idle` until the app reports again.
 
 ## Install

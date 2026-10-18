@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from homeassistant.components.media_player import DOMAIN as MEDIA_PLAYER_DOMAIN
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
+from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
 
 from .const import CAST_DOMAIN, CONF_HIDDEN
@@ -19,6 +19,13 @@ type CastGroupSyncConfigEntry = ConfigEntry[CastSessions]
 async def async_setup_entry(hass: HomeAssistant, entry: CastGroupSyncConfigEntry) -> bool:
     """Set up from a config entry."""
     entry.runtime_data = CastSessions(hass)
+
+    async def _shutdown(_event: Event) -> None:
+        await entry.runtime_data.async_shutdown()
+
+    entry.async_on_unload(
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _shutdown)
+    )
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
@@ -26,6 +33,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: CastGroupSyncConfigEntry
 async def async_unload_entry(hass: HomeAssistant, entry: CastGroupSyncConfigEntry) -> bool:
     """Unload a config entry; show the Google Cast entities again if disabled."""
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if unloaded:
+        await entry.runtime_data.async_shutdown()
     if unloaded and entry.disabled_by is not None:
         _unhide_cast_entities(hass, entry)
         hass.config_entries.async_update_entry(

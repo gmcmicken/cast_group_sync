@@ -16,7 +16,7 @@ from time import monotonic
 from typing import Any
 from uuid import UUID
 
-from pychromecast import Chromecast, get_chromecast_from_cast_info
+from pychromecast import Chromecast, dial, get_chromecast_from_cast_info
 from pychromecast.const import CAST_TYPE_AUDIO, CAST_TYPE_GROUP
 from pychromecast.controllers.media import (
     MEDIA_PLAYER_STATE_BUFFERING,
@@ -26,9 +26,13 @@ from pychromecast.controllers.media import (
     MediaController,
     MediaStatus,
 )
-from pychromecast.controllers.multizone import MULTIZONE_NAMESPACE
-from pychromecast.models import CastInfo, HostServiceInfo
+from pychromecast.controllers.multizone import (
+    MULTIZONE_NAMESPACE,
+    MultizoneController,
+)
+from pychromecast.models import CastInfo, HostServiceInfo, MDNSServiceInfo
 
+from homeassistant.components import zeroconf
 from homeassistant.components.media_player import DATA_COMPONENT
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.core import HomeAssistant
@@ -44,6 +48,10 @@ CHANGE_TIMEOUT = 15.0
 CONNECT_TIMEOUT = 10.0
 # Membership from the last change is shown until the stock integration catches up.
 PENDING_HOLD = 15.0
+# How often a speaker running without a session is asked which groups it's in.
+PROBE_INTERVAL = 30.0
+PROBE_TIMEOUT = 5.0
+CONNECT_TRIES = 3
 
 KIND_SPEAKER = "speaker"
 KIND_PAIR = "pair"
@@ -83,6 +91,19 @@ def _running(entity: Any) -> bool:
     """Whether a stock speaker is connected and running an app."""
     chromecast = getattr(entity, "_chromecast", None)
     return chromecast is not None and not chromecast.is_idle
+
+
+def _stopped(chromecast: Chromecast) -> bool:
+    """Whether a connection has given up reconnecting."""
+    return chromecast.socket_client.stop.is_set()
+
+
+@dataclass
+class _TrackedGroup:
+    """A dynamic group connected to by this integration, not the stock one."""
+
+    chromecast: Chromecast
+    multizone: MultizoneController
 
 
 @dataclass
@@ -135,6 +156,11 @@ class CastSessions:
         self._lock = asyncio.Lock()
         self._pending: list[_Pending] = []
         self._warned_private_api = False
+        # The stock integration drops a dynamic group when Cast moves it to another
+        # leader, or its mDNS record lapses, and doesn't always find it again.
+        self._tracked: dict[UUID, _TrackedGroup] = {}
+        self._next_probe: dict[UUID, float] = {}
+        self._tracking = False
 
     # ---------- stock integration access ----------
 
@@ -191,6 +217,19 @@ class CastSessions:
         }
 
     def _groups(self) -> list[tuple[UUID, Chromecast, list[UUID]]]:
+        """Groups the stock integration, or this one, is connected to, with members."""
+        groups = self._stock_groups()
+        stock = {group_uuid for group_uuid, _, _ in groups}
+        for group_uuid, tracked in list(self._tracked.items()):
+            if group_uuid in stock or _stopped(tracked.chromecast):
+                continue
+            members = [
+                uuid for member in tracked.multizone.members if (uuid := as_uuid(member))
+            ]
+            groups.append((group_uuid, tracked.chromecast, members))
+        return groups
+
+    def _stock_groups(self) -> list[tuple[UUID, Chromecast, list[UUID]]]:
         """Static and dynamic groups the stock integration is connected to, with members."""
         entry = self._cast_entry()
         manager = getattr(entry.runtime_data, "multizone_manager", None) if entry else None
@@ -200,13 +239,16 @@ class CastSessions:
         try:
             for group_id, info in list(manager._groups.items()):  # noqa: SLF001
                 group_uuid = as_uuid(group_id)
+                group_cast = info["chromecast"]
+                if group_uuid is None or _stopped(group_cast):
+                    # A group whose connection gave up keeps its last status forever.
+                    continue
                 members = [
                     uuid
                     for member in info["listener"]._mz.members  # noqa: SLF001
                     if (uuid := as_uuid(member))
                 ]
-                if group_uuid:
-                    groups.append((group_uuid, info["chromecast"], members))
+                groups.append((group_uuid, group_cast, members))
         except (AttributeError, KeyError, TypeError):
             if not self._warned_private_api:
                 self._warned_private_api = True
@@ -380,6 +422,99 @@ class CastSessions:
             key=lambda session: (_rank(session.media_status), len(session.members)),
             default=None,
         )
+
+    # ---------- tracking groups the stock integration lost ----------
+
+    async def async_track_groups(self) -> None:
+        """Connect to dynamic groups that speakers play in but nothing is connected to."""
+        if self._tracking:
+            return
+        self._tracking = True
+        try:
+            await self._async_track_groups()
+        finally:
+            self._tracking = False
+
+    async def _async_track_groups(self) -> None:
+        stock = {group_uuid for group_uuid, _, _ in self._stock_groups()}
+        for group_uuid, tracked in list(self._tracked.items()):
+            if group_uuid in stock or _stopped(tracked.chromecast):
+                await self._async_untrack(group_uuid)
+            elif not tracked.multizone.members and tracked.chromecast.socket_client.is_connected:
+                await self.hass.async_add_executor_job(tracked.multizone.update_members)
+
+        speakers = self.speakers()
+        grouped = {
+            uuid
+            for session in self.sessions()
+            if len(session.members) > 1
+            for uuid in session.members
+        }
+        now = monotonic()
+        for uuid, entity in speakers.items():
+            # A speaker playing in a group nothing is connected to runs its app alone.
+            if uuid in grouped or not _running(entity) or self._next_probe.get(uuid, 0) > now:
+                continue
+            self._next_probe[uuid] = now + PROBE_INTERVAL
+            host = entity._chromecast.cast_info.host  # noqa: SLF001
+            try:
+                status = await self.hass.async_add_executor_job(
+                    dial.get_multizone_status, host, None, None, PROBE_TIMEOUT
+                )
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug("Couldn't get the groups of %s", host, exc_info=True)
+                continue
+            for group in status.dynamic_groups if status else []:
+                if group.uuid not in stock and group.uuid not in self._tracked:
+                    await self._async_track(group.uuid, group.friendly_name)
+
+    async def _async_track(self, group_uuid: UUID, name: str | None) -> None:
+        cast_info = CastInfo(
+            {MDNSServiceInfo(f"Google-Cast-Group-{group_uuid.hex}._googlecast._tcp.local.")},
+            group_uuid,
+            "Google Cast Group",
+            name,
+            None,  # type: ignore[arg-type]  # resolved over mDNS on each connect
+            None,  # type: ignore[arg-type]
+            CAST_TYPE_GROUP,
+            "Google Inc.",
+        )
+        zconf = await zeroconf.async_get_instance(self.hass)
+
+        def _start() -> _TrackedGroup | None:
+            chromecast = get_chromecast_from_cast_info(
+                cast_info, zconf, tries=CONNECT_TRIES, timeout=CONNECT_TIMEOUT
+            )
+            multizone = MultizoneController(group_uuid)
+            chromecast.register_handler(multizone)
+            chromecast.wait(timeout=CONNECT_TIMEOUT)
+            if not chromecast.socket_client.is_connected:
+                chromecast.disconnect(timeout=CONNECT_TIMEOUT)
+                return None
+            multizone.update_members()
+            return _TrackedGroup(chromecast, multizone)
+
+        try:
+            tracked = await self.hass.async_add_executor_job(_start)
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug("Couldn't connect to group %s", name, exc_info=True)
+            return
+        if tracked is None:
+            _LOGGER.debug("Couldn't connect to group %s", name)
+            return
+        _LOGGER.info("Following group %s, which Google Cast lost track of", name)
+        self._tracked[group_uuid] = tracked
+
+    async def _async_untrack(self, group_uuid: UUID) -> None:
+        if (tracked := self._tracked.pop(group_uuid, None)) is not None:
+            await self.hass.async_add_executor_job(
+                tracked.chromecast.disconnect, CONNECT_TIMEOUT
+            )
+
+    async def async_shutdown(self) -> None:
+        """Disconnect from the groups this integration connected to."""
+        for group_uuid in list(self._tracked):
+            await self._async_untrack(group_uuid)
 
     # ---------- multizone protocol ----------
 

@@ -53,6 +53,7 @@ _LOGGER = logging.getLogger(__name__)
 # Group membership changes don't always produce a stock state change.
 SCAN_INTERVAL = timedelta(seconds=5)
 DISCOVERY_INTERVAL = timedelta(seconds=30)
+TRACK_INTERVAL = timedelta(seconds=10)
 PARALLEL_UPDATES = 0
 REFRESH_DELAY = 2.0
 
@@ -144,6 +145,15 @@ async def async_setup_entry(
         hass.bus.async_listen(er.EVENT_ENTITY_REGISTRY_UPDATED, _add_new)
     )
     entry.async_on_unload(async_track_time_interval(hass, _add_new, DISCOVERY_INTERVAL))
+
+    async def _track_groups(_now: Any = None) -> None:
+        await sessions.async_track_groups()
+
+    entry.async_on_unload(
+        async_track_time_interval(
+            hass, _track_groups, TRACK_INTERVAL, name="cast_group_sync track groups"
+        )
+    )
 
 
 def _device_name(hass: HomeAssistant, registry_entry: er.RegistryEntry) -> str | None:
@@ -646,8 +656,23 @@ class GroupAudioPlayer(MediaPlayerEntity):
         await self._session_command("stop")
 
     async def async_turn_off(self) -> None:
-        """Stop playback on every speaker in the group."""
-        await self._session_command("stop")
+        """End the session on every speaker in the group, like the Cast power button."""
+        session = self._require_session()
+        # Apps like YouTube Music treat a media stop as a pause; quitting ends it.
+        chromecasts = list(dict.fromkeys([*session.endpoints, session.source]))
+
+        def _quit() -> None:
+            errors = []
+            for chromecast in chromecasts:
+                try:
+                    chromecast.quit_app()
+                except Exception as err:  # noqa: BLE001
+                    errors.append(err)
+            if len(errors) == len(chromecasts):
+                raise HomeAssistantError(f"Couldn't turn off the group: {errors[0]}")
+
+        await self.hass.async_add_executor_job(_quit)
+        self._refresh_soon()
 
     async def async_media_next_track(self) -> None:
         """Skip forward."""
