@@ -41,6 +41,7 @@ from . import CastGroupSyncConfigEntry
 from .const import CAST_DOMAIN, CONF_HIDDEN, DOMAIN
 from .session import (
     DYNAMIC_GROUP_NAME,
+    KIND_GROUP,
     KIND_PAIR,
     KIND_SPEAKER,
     CastSessions,
@@ -137,6 +138,9 @@ async def async_setup_entry(
             decided.add(registry_entry.unique_id)
             if kind in (KIND_SPEAKER, KIND_PAIR):
                 new.append(SyncedCastPlayer(sessions, registry_entry))
+                _hide(registry_entry)
+            elif kind == KIND_GROUP:
+                # A Google Home speaker group; Group Audio mirrors it while it plays.
                 _hide(registry_entry)
         if new:
             async_add_entities(new)

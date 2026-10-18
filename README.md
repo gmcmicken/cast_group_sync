@@ -15,7 +15,7 @@ Volume and mute stay per speaker. Play, pause, skip, and seek control the whole 
 
 Every player has a `reach` attribute: the number of speakers it plays on. It's 1 for a speaker, the group's size for Group Audio, and 0 when Group Audio is off. Sorting by it in descending order puts Group Audio ahead of its members, so a card showing only the top entity shows the group when one is playing and a lone speaker otherwise.
 
-The built-in Google Cast entities that these replace (speakers, stereo pairs, and the "Speaker + N" groups Cast creates while music plays on several speakers) are hidden, so they drop out of auto-generated dashboards and area views but keep working. They aren't disabled, because this integration uses their connections. Unhiding one yourself sticks, and they're all unhidden if Cast Group Sync is disabled or removed.
+The built-in Google Cast entities that these replace (speakers, stereo pairs, speaker groups like "Home Audio", and the "Speaker + N" groups Cast creates while music plays on several speakers) are hidden, so they drop out of auto-generated dashboards and area views but keep working; Group Audio shows whatever plays on a group, and you can still target a speaker group directly, e.g. to start music on "Home Audio". They aren't disabled, because this integration uses their connections. Unhiding one yourself sticks, and they're all unhidden if Cast Group Sync is disabled or removed.
 
 For example, this action adds the deck and hot tub to whatever the kitchen is playing:
 
