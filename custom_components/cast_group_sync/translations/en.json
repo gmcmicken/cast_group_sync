@@ -1,0 +1,13 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Cast Group Sync",
+        "description": "Adds a group-aware \"Synced\" media player next to each Google Cast speaker. Every speaker in a playing group reports the group's state and track, and speakers can be added to or removed from whatever is playing."
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Cast Group Sync is already set up."
+    }
+  }
+}
