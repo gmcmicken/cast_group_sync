@@ -1,11 +1,13 @@
 # Cast Group Sync
 
-Adds a **Synced** media player for every Google Cast speaker (e.g. `media_player.kitchen_nest_synced`) that fixes two problems when playing music to groups of Nest speakers:
+Adds a **Synced** media player for every Google Cast speaker and stereo pair (e.g. `media_player.kitchen_nest_synced`) that fixes two problems when playing music to groups of Nest speakers:
 
 - **Every speaker in a group reports the group's playback.** With the built-in Google Cast integration, only the speaker leading a group reports `playing`; the others show `idle` or `off`. The Synced player shows the same state, track, artwork, and position on every speaker the music is playing on, and `group_members` lists them all.
 - **Speakers can be added to or removed from music that is already playing** without restarting it (Cast "stream expansion", the same as the Google Home app). This works with `media_player.join` / `media_player.unjoin` and the group controls in the media player dialog.
 
 It reuses the connections of the built-in Google Cast integration, so no extra connections are opened in normal use.
+
+Each Synced player is on its own device, named after the speaker. Stereo pairs get one player for the pair, since Cast plays them as a single speaker. TVs and other video devices are skipped, as are speaker groups you've made in the Google Home app (e.g. "Home Audio"); use `join` to play to several speakers instead.
 
 Volume and mute stay per speaker. Play, pause, skip, and seek control the whole group from any of its speakers. Turning off a grouped speaker removes it from the group and the others keep playing; turning off the last speaker stops playback.
 

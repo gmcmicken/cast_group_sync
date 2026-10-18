@@ -35,16 +35,17 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
-from homeassistant.helpers.event import async_call_later
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
 
 from . import CastGroupSyncConfigEntry
-from .const import CAST_DOMAIN, CAST_GROUP_MODEL, DOMAIN
-from .session import CastSessions, Session, as_uuid
+from .const import CAST_DOMAIN, DOMAIN
+from .session import KIND_PAIR, KIND_SPEAKER, CastSessions, Session, as_uuid
 
 _LOGGER = logging.getLogger(__name__)
 
 # Group membership changes don't always produce a stock state change.
 SCAN_INTERVAL = timedelta(seconds=5)
+DISCOVERY_INTERVAL = timedelta(seconds=30)
 PARALLEL_UPDATES = 0
 REFRESH_DELAY = 2.0
 
@@ -76,39 +77,34 @@ MIRRORED = (
 )
 
 
-def _is_cast_group(hass: HomeAssistant, entry: er.RegistryEntry) -> bool:
-    component = hass.data.get(DATA_COMPONENT)
-    stock = component.get_entity(entry.entity_id) if component else None
-    if (info := getattr(stock, "_cast_info", None)) is not None:
-        return info.is_audio_group
-    device = dr.async_get(hass).async_get(entry.device_id) if entry.device_id else None
-    return device is not None and device.model == CAST_GROUP_MODEL
-
-
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: CastGroupSyncConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Add a synced player for every stock Cast speaker, including ones found later."""
+    """Add a synced player for every Cast speaker and stereo pair, including later ones."""
     sessions = entry.runtime_data
-    added: set[str] = set()
+    # Unique IDs that have been decided: added, or skipped as a TV or group.
+    decided: set[str] = set()
 
     @callback
-    def _add_new(_event: Event | None = None) -> None:
+    def _add_new(_event: Any = None) -> None:
         new = []
         for registry_entry in list(er.async_get(hass).entities.values()):
             if (
                 registry_entry.platform != CAST_DOMAIN
                 or registry_entry.domain != MEDIA_PLAYER_DOMAIN
                 or registry_entry.disabled
-                or registry_entry.unique_id in added
-                or as_uuid(registry_entry.unique_id) is None
-                or _is_cast_group(hass, registry_entry)
+                or registry_entry.unique_id in decided
+                or (uuid := as_uuid(registry_entry.unique_id)) is None
             ):
                 continue
-            added.add(registry_entry.unique_id)
-            new.append(SyncedCastPlayer(sessions, registry_entry))
+            # Groups are decided once their members are known; retried until then.
+            if (kind := sessions.kind(uuid)) is None:
+                continue
+            decided.add(registry_entry.unique_id)
+            if kind in (KIND_SPEAKER, KIND_PAIR):
+                new.append(SyncedCastPlayer(sessions, registry_entry))
         if new:
             async_add_entities(new)
 
@@ -116,6 +112,8 @@ async def async_setup_entry(
     entry.async_on_unload(
         hass.bus.async_listen(er.EVENT_ENTITY_REGISTRY_UPDATED, _add_new)
     )
+    entry.async_on_unload(async_track_time_interval(hass, _add_new, DISCOVERY_INTERVAL))
+
 
 
 class SyncedCastPlayer(MediaPlayerEntity):
@@ -134,8 +132,24 @@ class SyncedCastPlayer(MediaPlayerEntity):
         self._uuid = UUID(registry_entry.unique_id)
         self._session: Session | None = None
         self._attr_unique_id = registry_entry.unique_id
-        # Attach to the stock device so area and naming follow the speaker.
-        self._attr_device_info = DeviceInfo(identifiers={(CAST_DOMAIN, self._uuid.hex)})
+        # Own device per speaker, named after it; the Google Cast device belongs to cast.
+        stock_device = (
+            dr.async_get(sessions.hass).async_get(registry_entry.device_id)
+            if registry_entry.device_id
+            else None
+        )
+        name = (
+            (stock_device.name_by_user or stock_device.name) if stock_device else None
+        ) or registry_entry.original_name or str(self._uuid)
+        self._stock_area_id = (
+            registry_entry.area_id or (stock_device.area_id if stock_device else None)
+        )
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, self._uuid.hex)},
+            name=name,
+            manufacturer=stock_device.manufacturer if stock_device else None,
+            model=stock_device.model if stock_device else None,
+        )
 
     # ---------- stock entity access ----------
 
@@ -165,6 +179,11 @@ class SyncedCastPlayer(MediaPlayerEntity):
     async def async_added_to_hass(self) -> None:
         """Refresh whenever any stock Cast player changes."""
         registry = er.async_get(self.hass)
+        if self._stock_area_id and self.registry_entry and self.registry_entry.device_id:
+            devices = dr.async_get(self.hass)
+            device = devices.async_get(self.registry_entry.device_id)
+            if device is not None and device.area_id is None:
+                devices.async_update_device(device.id, area_id=self._stock_area_id)
 
         @callback
         def _is_cast(event_data: EventStateChangedData) -> bool:

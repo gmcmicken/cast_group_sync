@@ -16,7 +16,7 @@ from typing import Any
 from uuid import UUID
 
 from pychromecast import Chromecast, get_chromecast_from_cast_info
-from pychromecast.const import CAST_TYPE_GROUP
+from pychromecast.const import CAST_TYPE_AUDIO, CAST_TYPE_GROUP
 from pychromecast.controllers.media import (
     MEDIA_PLAYER_STATE_BUFFERING,
     MEDIA_PLAYER_STATE_PAUSED,
@@ -43,6 +43,11 @@ CHANGE_TIMEOUT = 15.0
 CONNECT_TIMEOUT = 10.0
 # Membership from the last change is shown until the stock integration catches up.
 PENDING_HOLD = 15.0
+
+KIND_SPEAKER = "speaker"
+KIND_PAIR = "pair"
+KIND_GROUP = "group"
+KIND_VIDEO = "video"
 
 _ACTIVE_RANK = {
     MEDIA_PLAYER_STATE_PLAYING: 3,
@@ -135,24 +140,51 @@ class CastSessions:
                 return entry
         return None
 
-    def speakers(self) -> dict[UUID, Any]:
-        """Stock Cast speaker entities by device UUID; groups are excluded."""
+    def _stock_entities(self) -> dict[UUID, Any]:
         component = self.hass.data.get(DATA_COMPONENT)
         if component is None:
             return {}
-        speakers = {}
+        entities = {}
         for entity in component.entities:
             platform = entity.platform
             info = getattr(entity, "_cast_info", None)
-            if (
-                platform is None
-                or platform.platform_name != CAST_DOMAIN
-                or info is None
-                or info.is_audio_group
-            ):
-                continue
-            speakers[info.uuid] = entity
-        return speakers
+            if platform is not None and platform.platform_name == CAST_DOMAIN and info:
+                entities[info.uuid] = entity
+        return entities
+
+    @staticmethod
+    def _kind(
+        entity: Any, members: dict[UUID, list[UUID]]
+    ) -> str | None:
+        """speaker, pair, group, or video; None until a group's members are known."""
+        info = entity._cast_info  # noqa: SLF001
+        cast_type = info.cast_info.cast_type
+        if cast_type == CAST_TYPE_AUDIO:
+            return KIND_SPEAKER
+        if cast_type != CAST_TYPE_GROUP:
+            return KIND_VIDEO
+        group_members = members.get(info.uuid)
+        if not group_members:
+            return None
+        # A stereo pair lists only itself; its two halves are multichannel devices.
+        return KIND_PAIR if group_members == [info.uuid] else KIND_GROUP
+
+    def kind(self, uuid: UUID) -> str | None:
+        """What a stock Cast entity is; None if it isn't loaded or isn't known yet."""
+        entity = self._stock_entities().get(uuid)
+        if entity is None:
+            return None
+        members = {group: m for group, _, m in self._groups()}
+        return self._kind(entity, members)
+
+    def speakers(self) -> dict[UUID, Any]:
+        """Stock Cast entities that play as one unit: speakers and stereo pairs."""
+        members = {group: m for group, _, m in self._groups()}
+        return {
+            uuid: entity
+            for uuid, entity in self._stock_entities().items()
+            if self._kind(entity, members) in (KIND_SPEAKER, KIND_PAIR)
+        }
 
     def _groups(self) -> list[tuple[UUID, Chromecast, list[UUID]]]:
         """Static and dynamic groups the stock integration is connected to, with members."""
@@ -210,7 +242,8 @@ class CastSessions:
 
         candidates: list[tuple[tuple[int, bool, int], Session]] = []
         for group_uuid, group_cast, raw_members in self._groups():
-            if not raw_members:
+            if not raw_members or group_uuid in speakers:
+                # Stereo pairs are handled as speakers.
                 continue
             # Dynamic groups exist only while a session spans several speakers.
             dynamic = group_uuid not in registered
@@ -395,9 +428,16 @@ class CastSessions:
 
         return await self.hass.async_add_executor_job(_start)
 
-    def _device_entry(self, uuid: UUID, speakers: dict[UUID, Any]) -> dict[str, Any]:
-        entry: dict[str, Any] = {"deviceId": str(uuid)}
-        if (info := self._cast_info(uuid, speakers)) and info.host:
+    def _device_entry(
+        self, uuid: UUID, speakers: dict[UUID, Any], reported: str | None
+    ) -> dict[str, Any]:
+        info = self._cast_info(uuid, speakers)
+        if reported is None:
+            # Devices report groups and pairs without dashes, single speakers with.
+            group = info is not None and info.cast_type == CAST_TYPE_GROUP
+            reported = uuid.hex if group else str(uuid)
+        entry: dict[str, Any] = {"deviceId": reported}
+        if info and info.host:
             entry["ipAddress"] = info.host
             entry["port"] = info.port or 8009
         return entry
@@ -487,11 +527,12 @@ class CastSessions:
         if reply.get("type") != "MULTIZONE_STATUS" or playback is None:
             _LOGGER.debug("%s holds no playback session: %s", chromecast.uri, reply)
             return False
-        current = [
-            uuid
+        reported = {
+            uuid: device["deviceId"]
             for device in multizone.get("devices", [])
             if (uuid := as_uuid(device.get("deviceId")))
-        ] or list(session.members)
+        }
+        current = list(reported) or list(session.members)
 
         target = list(dict.fromkeys(change(current)))
         if not target:
@@ -521,7 +562,10 @@ class CastSessions:
             {
                 "type": "SET_PLAYBACK_DEVICES",
                 "sessionId": session_id,
-                "deviceList": [self._device_entry(uuid, speakers) for uuid in target],
+                "deviceList": [
+                    self._device_entry(uuid, speakers, reported.get(uuid))
+                    for uuid in target
+                ],
             },
             CHANGE_TIMEOUT,
         )
