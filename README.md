@@ -7,7 +7,7 @@ Adds a **Synced** media player for every Google Cast speaker and stereo pair (e.
 
 It reuses the connections of the built-in Google Cast integration, so no extra connections are opened in normal use.
 
-Each Synced player is on its own device, named after the speaker. Stereo pairs get one player for the pair, since Cast plays them as a single speaker. TVs and other video devices are skipped, as are speaker groups you've made in the Google Home app (e.g. "Home Audio"); use `join` to play to several speakers instead.
+Each Synced player is on its own device and has the speaker's own name (e.g. "Kitchen Nest"). Stereo pairs get one player for the pair, since Cast plays them as a single speaker. TVs and other video devices are skipped, as are speaker groups you've made in the Google Home app (e.g. "Home Audio"); use `join` to play to several speakers instead.
 
 Volume and mute stay per speaker. Play, pause, skip, and seek control the whole group from any of its speakers. Turning off a grouped speaker removes it from the group and the others keep playing; turning off the last speaker stops playback.
 

@@ -160,7 +160,7 @@ class SyncedCastPlayer(MediaPlayerEntity):
     """A Cast speaker that reports, and controls, the session it's playing."""
 
     _attr_has_entity_name = True
-    _attr_name = "Synced"
+    _attr_name = None
     _attr_should_poll = True
     _attr_device_class = MediaPlayerDeviceClass.SPEAKER
     _attr_media_image_remotely_accessible = True
