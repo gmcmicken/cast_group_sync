@@ -56,6 +56,8 @@ DISCOVERY_INTERVAL = timedelta(seconds=30)
 TRACK_INTERVAL = timedelta(seconds=10)
 PARALLEL_UPDATES = 0
 REFRESH_DELAY = 2.0
+# Number of speakers an entity plays on, for sorting the group above its members.
+ATTR_REACH = "reach"
 
 STATE_MAP = {
     MEDIA_PLAYER_STATE_PLAYING: MediaPlayerState.PLAYING,
@@ -281,6 +283,11 @@ class SyncedCastPlayer(MediaPlayerEntity):
             else []
         )
         self._attr_group_members = members or ([self.entity_id] if self.entity_id else [])
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """A speaker reaches only itself; Group Audio reaches the whole group."""
+        return {ATTR_REACH: 1}
 
     def _mirror_session(self, session: Session) -> None:
         status = session.media_status
@@ -591,6 +598,11 @@ class GroupAudioPlayer(MediaPlayerEntity):
             for state in self._member_states().values()
         ]
         self._attr_is_volume_muted = bool(muted) and all(muted)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """How many speakers the group plays on; sorts it above its members."""
+        return {ATTR_REACH: len(self._session.members) if self._session else 0}
 
     @property
     def supported_features(self) -> MediaPlayerEntityFeature:
