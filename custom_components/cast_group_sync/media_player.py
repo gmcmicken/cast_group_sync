@@ -38,8 +38,15 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.event import async_call_later, async_track_time_interval
 
 from . import CastGroupSyncConfigEntry
-from .const import CAST_DOMAIN, DOMAIN
-from .session import KIND_PAIR, KIND_SPEAKER, CastSessions, Session, as_uuid
+from .const import CAST_DOMAIN, CONF_HIDDEN, DOMAIN
+from .session import (
+    DYNAMIC_GROUP_NAME,
+    KIND_PAIR,
+    KIND_SPEAKER,
+    CastSessions,
+    Session,
+    as_uuid,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -82,15 +89,30 @@ async def async_setup_entry(
     entry: CastGroupSyncConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Add a synced player for every Cast speaker and stereo pair, including later ones."""
+    """Add a synced player for every Cast speaker and stereo pair, plus Group Audio."""
     sessions = entry.runtime_data
+    registry = er.async_get(hass)
     # Unique IDs that have been decided: added, or skipped as a TV or group.
     decided: set[str] = set()
 
     @callback
+    def _hide(registry_entry: er.RegistryEntry) -> None:
+        """Hide a replaced Google Cast entity once; later choices by the user stick."""
+        hidden = entry.data.get(CONF_HIDDEN, [])
+        if registry_entry.unique_id in hidden:
+            return
+        if registry_entry.hidden_by is None:
+            registry.async_update_entity(
+                registry_entry.entity_id, hidden_by=er.RegistryEntryHider.INTEGRATION
+            )
+        hass.config_entries.async_update_entry(
+            entry, data={**entry.data, CONF_HIDDEN: [*hidden, registry_entry.unique_id]}
+        )
+
+    @callback
     def _add_new(_event: Any = None) -> None:
-        new = []
-        for registry_entry in list(er.async_get(hass).entities.values()):
+        new: list[MediaPlayerEntity] = []
+        for registry_entry in list(registry.entities.values()):
             if (
                 registry_entry.platform != CAST_DOMAIN
                 or registry_entry.domain != MEDIA_PLAYER_DOMAIN
@@ -99,20 +121,38 @@ async def async_setup_entry(
                 or (uuid := as_uuid(registry_entry.unique_id)) is None
             ):
                 continue
+            if DYNAMIC_GROUP_NAME.search(
+                registry_entry.original_name or _device_name(hass, registry_entry) or ""
+            ):
+                # A "Speaker + N" group Cast made during playback; Group Audio replaces it.
+                decided.add(registry_entry.unique_id)
+                _hide(registry_entry)
+                continue
             # Groups are decided once their members are known; retried until then.
             if (kind := sessions.kind(uuid)) is None:
                 continue
             decided.add(registry_entry.unique_id)
             if kind in (KIND_SPEAKER, KIND_PAIR):
                 new.append(SyncedCastPlayer(sessions, registry_entry))
+                _hide(registry_entry)
         if new:
             async_add_entities(new)
 
+    async_add_entities([GroupAudioPlayer(sessions)])
     _add_new()
     entry.async_on_unload(
         hass.bus.async_listen(er.EVENT_ENTITY_REGISTRY_UPDATED, _add_new)
     )
     entry.async_on_unload(async_track_time_interval(hass, _add_new, DISCOVERY_INTERVAL))
+
+
+def _device_name(hass: HomeAssistant, registry_entry: er.RegistryEntry) -> str | None:
+    device = (
+        dr.async_get(hass).async_get(registry_entry.device_id)
+        if registry_entry.device_id
+        else None
+    )
+    return (device.name_by_user or device.name) if device else None
 
 
 
@@ -451,5 +491,238 @@ class SyncedCastPlayer(MediaPlayerEntity):
             self._uuid,
             lambda current: [uuid for uuid in current if uuid != self._uuid],
             adding=False,
+        )
+        self._refresh_soon()
+
+
+class GroupAudioPlayer(MediaPlayerEntity):
+    """The session playing on several speakers, under one fixed name."""
+
+    _attr_has_entity_name = True
+    _attr_name = None
+    _attr_should_poll = True
+    _attr_device_class = MediaPlayerDeviceClass.SPEAKER
+    _attr_media_image_remotely_accessible = True
+    _attr_unique_id = "group_audio"
+    _attr_device_info = DeviceInfo(identifiers={(DOMAIN, "group_audio")}, name="Group Audio")
+
+    _mirror_session = SyncedCastPlayer._mirror_session  # noqa: SLF001
+
+    def __init__(self, sessions: CastSessions) -> None:
+        """Initialise."""
+        self._sessions = sessions
+        self._session: Session | None = None
+
+    def _entity_id_for(self, uuid: UUID, platform: str = DOMAIN) -> str | None:
+        return er.async_get(self.hass).async_get_entity_id(
+            MEDIA_PLAYER_DOMAIN, platform, str(uuid)
+        )
+
+    def _member_states(self) -> dict[str, Any]:
+        """Stock entity ID and state of each speaker in the group."""
+        session = self._session
+        states = {}
+        for uuid in session.members if session else []:
+            if (entity_id := self._entity_id_for(uuid, CAST_DOMAIN)) and (
+                state := self.hass.states.get(entity_id)
+            ):
+                states[entity_id] = state
+        return states
+
+    async def async_added_to_hass(self) -> None:
+        """Refresh whenever any stock Cast player changes."""
+        registry = er.async_get(self.hass)
+
+        @callback
+        def _is_cast(event_data: EventStateChangedData) -> bool:
+            entry = registry.async_get(event_data["entity_id"])
+            return entry is not None and entry.platform == CAST_DOMAIN
+
+        @callback
+        def _changed(_event: Event[EventStateChangedData]) -> None:
+            self.async_schedule_update_ha_state(True)
+
+        self.async_on_remove(
+            self.hass.bus.async_listen(EVENT_STATE_CHANGED, _changed, event_filter=_is_cast)
+        )
+        self.async_schedule_update_ha_state(True)
+
+    async def async_update(self) -> None:
+        """Mirror the session playing on several speakers; off when there's none."""
+        session = self._session = self._sessions.group_session()
+        if session is None:
+            self._attr_state = MediaPlayerState.OFF
+            for attribute in MIRRORED[1:]:
+                setattr(self, f"_attr_{attribute}", None)
+            self._attr_group_members = []
+            self._attr_volume_level = None
+            self._attr_is_volume_muted = None
+            return
+
+        if session.media_status is None:
+            for attribute in MIRRORED[1:]:
+                setattr(self, f"_attr_{attribute}", None)
+            self._attr_state = MediaPlayerState.IDLE
+            self._attr_app_id = session.app_id
+            self._attr_app_name = session.app_name
+        else:
+            self._mirror_session(session)
+        self._attr_group_members = [
+            entity_id for uuid in session.members if (entity_id := self._entity_id_for(uuid))
+        ]
+        levels = [
+            level
+            for state in self._member_states().values()
+            if (level := state.attributes.get(ATTR_MEDIA_VOLUME_LEVEL)) is not None
+        ]
+        self._attr_volume_level = sum(levels) / len(levels) if levels else None
+        muted = [
+            state.attributes.get(ATTR_MEDIA_VOLUME_MUTED)
+            for state in self._member_states().values()
+        ]
+        self._attr_is_volume_muted = bool(muted) and all(muted)
+
+    @property
+    def supported_features(self) -> MediaPlayerEntityFeature:
+        """Group volume, transport for the session, and adding speakers."""
+        features = MediaPlayerEntityFeature.GROUPING
+        session = self._session
+        if session is None:
+            return features
+        features |= (
+            MediaPlayerEntityFeature.TURN_OFF
+            | MediaPlayerEntityFeature.VOLUME_SET
+            | MediaPlayerEntityFeature.VOLUME_STEP
+            | MediaPlayerEntityFeature.VOLUME_MUTE
+        )
+        if (status := session.media_status) is None:
+            return features
+        features |= (
+            MediaPlayerEntityFeature.PLAY
+            | MediaPlayerEntityFeature.PAUSE
+            | MediaPlayerEntityFeature.STOP
+        )
+        if status.supports_queue_next:
+            features |= (
+                MediaPlayerEntityFeature.NEXT_TRACK | MediaPlayerEntityFeature.PREVIOUS_TRACK
+            )
+        if status.supports_seek:
+            features |= MediaPlayerEntityFeature.SEEK
+        return features
+
+    @callback
+    def _refresh_soon(self) -> None:
+        self.async_schedule_update_ha_state(True)
+
+        @callback
+        def _later(_now) -> None:
+            self.async_schedule_update_ha_state(True)
+
+        async_call_later(self.hass, REFRESH_DELAY, _later)
+
+    def _require_session(self) -> Session:
+        if (session := self._sessions.group_session()) is None:
+            raise HomeAssistantError("Nothing is playing on several speakers")
+        return session
+
+    async def _session_command(self, method: str, *args: Any) -> None:
+        session = self._require_session()
+        try:
+            await self.hass.async_add_executor_job(getattr(session.controller, method), *args)
+        except PyChromecastError as err:
+            raise HomeAssistantError(f"{method} failed: {err}") from err
+        self._refresh_soon()
+
+    async def async_media_play(self) -> None:
+        """Resume."""
+        await self._session_command("play")
+
+    async def async_media_pause(self) -> None:
+        """Pause."""
+        await self._session_command("pause")
+
+    async def async_media_stop(self) -> None:
+        """Stop."""
+        await self._session_command("stop")
+
+    async def async_turn_off(self) -> None:
+        """Stop playback on every speaker in the group."""
+        await self._session_command("stop")
+
+    async def async_media_next_track(self) -> None:
+        """Skip forward."""
+        await self._session_command("queue_next")
+
+    async def async_media_previous_track(self) -> None:
+        """Skip back."""
+        await self._session_command("queue_prev")
+
+    async def async_media_seek(self, position: float) -> None:
+        """Seek within the track."""
+        await self._session_command("seek", position)
+
+    async def async_set_volume_level(self, volume: float) -> None:
+        """Set every speaker in the group to exactly this volume."""
+        self._session = self._require_session()
+        entity_ids = list(self._member_states())
+        if entity_ids:
+            await self.hass.services.async_call(
+                MEDIA_PLAYER_DOMAIN,
+                "volume_set",
+                {ATTR_ENTITY_ID: entity_ids, ATTR_MEDIA_VOLUME_LEVEL: volume},
+                blocking=True,
+            )
+        self._refresh_soon()
+
+    async def async_mute_volume(self, mute: bool) -> None:
+        """Mute every speaker in the group."""
+        self._session = self._require_session()
+        entity_ids = list(self._member_states())
+        if entity_ids:
+            await self.hass.services.async_call(
+                MEDIA_PLAYER_DOMAIN,
+                "volume_mute",
+                {ATTR_ENTITY_ID: entity_ids, ATTR_MEDIA_VOLUME_MUTED: mute},
+                blocking=True,
+            )
+        self._refresh_soon()
+
+    def _uuids(self, entity_ids: list[str]) -> list[UUID]:
+        registry = er.async_get(self.hass)
+        uuids = []
+        for entity_id in entity_ids:
+            entry = registry.async_get(entity_id)
+            if entry is None or entry.platform not in (DOMAIN, CAST_DOMAIN) or not (
+                uuid := as_uuid(entry.unique_id)
+            ):
+                raise HomeAssistantError(f"{entity_id} isn't a Google Cast speaker")
+            uuids.append(uuid)
+        return uuids
+
+    async def async_join_players(self, group_members: list[str]) -> None:
+        """Add speakers to the group, or start one from a speaker that's playing."""
+        joining = self._uuids(group_members)
+        session = self._sessions.group_session()
+        if session is not None:
+            anchor = session.members[0]
+        else:
+            anchor = next(
+                (uuid for uuid in joining if self._sessions.session_for(uuid)), None
+            )
+            if anchor is None:
+                raise HomeAssistantError("Nothing is playing on these speakers")
+        await self._sessions.async_change_members(
+            anchor,
+            lambda current: [*current, *(u for u in joining if u not in current)],
+            adding=True,
+        )
+        self._refresh_soon()
+
+    async def async_unjoin_player(self) -> None:
+        """Break up the group; the first speaker keeps playing."""
+        session = self._require_session()
+        leader = session.members[0]
+        await self._sessions.async_change_members(
+            leader, lambda current: [leader], adding=False
         )
         self._refresh_soon()

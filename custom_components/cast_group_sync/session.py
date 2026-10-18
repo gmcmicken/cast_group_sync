@@ -11,6 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 import logging
+import re
 from time import monotonic
 from typing import Any
 from uuid import UUID
@@ -48,6 +49,9 @@ KIND_SPEAKER = "speaker"
 KIND_PAIR = "pair"
 KIND_GROUP = "group"
 KIND_VIDEO = "video"
+
+# Cast names dynamic groups after their leader, e.g. "Living Room Nest + 4".
+DYNAMIC_GROUP_NAME = re.compile(r" \+ \d+$")
 
 _ACTIVE_RANK = {
     MEDIA_PLAYER_STATE_PLAYING: 3,
@@ -245,8 +249,11 @@ class CastSessions:
             if not raw_members or group_uuid in speakers:
                 # Stereo pairs are handled as speakers.
                 continue
-            # Dynamic groups exist only while a session spans several speakers.
-            dynamic = group_uuid not in registered
+            # Dynamic groups exist only while a session spans several speakers. Cast
+            # sometimes registers one as an entity, so its name is checked too.
+            dynamic = group_uuid not in registered or bool(
+                DYNAMIC_GROUP_NAME.search(group_cast.cast_info.friendly_name or "")
+            )
             app_running = not group_cast.is_idle
             if not dynamic and not app_running:
                 continue
@@ -364,6 +371,14 @@ class CastSessions:
         """The session a speaker is playing, if any."""
         return next(
             (session for session in self.sessions() if uuid in session.members), None
+        )
+
+    def group_session(self) -> Session | None:
+        """The session playing on several speakers; the busiest if there are more."""
+        return max(
+            (session for session in self.sessions() if len(session.members) > 1),
+            key=lambda session: (_rank(session.media_status), len(session.members)),
+            default=None,
         )
 
     # ---------- multizone protocol ----------
