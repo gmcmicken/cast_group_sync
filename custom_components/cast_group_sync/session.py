@@ -61,6 +61,9 @@ KIND_VIDEO = "video"
 # Cast names dynamic groups after their leader, e.g. "Living Room Nest + 4".
 DYNAMIC_GROUP_NAME = re.compile(r" \+ \d+$")
 
+# Google's smart displays: "Google Nest Hub", "Google Nest Hub Max", "Google Home Hub".
+SMART_DISPLAY_MODEL = re.compile(r"\b(Nest|Home) Hub\b", re.IGNORECASE)
+
 _ACTIVE_RANK = {
     MEDIA_PLAYER_STATE_PLAYING: 3,
     MEDIA_PLAYER_STATE_BUFFERING: 3,
@@ -78,6 +81,11 @@ def as_uuid(value: Any) -> UUID | None:
         return UUID(str(value))
     except ValueError:
         return None
+
+
+def _smart_display(model_name: str | None) -> bool:
+    """Google smart displays (Nest Hub, Nest Hub Max, Home Hub), which group like speakers."""
+    return bool(model_name) and SMART_DISPLAY_MODEL.search(model_name) is not None
 
 
 def _rank(status: MediaStatus | None) -> int:
@@ -189,7 +197,8 @@ class CastSessions:
         """speaker, pair, group, or video; None until a group's members are known."""
         info = entity._cast_info  # noqa: SLF001
         cast_type = info.cast_info.cast_type
-        if cast_type == CAST_TYPE_AUDIO:
+        if cast_type == CAST_TYPE_AUDIO or _smart_display(info.cast_info.model_name):
+            # Nest Hubs report as video devices but join speaker groups like speakers.
             return KIND_SPEAKER
         if cast_type != CAST_TYPE_GROUP:
             return KIND_VIDEO
